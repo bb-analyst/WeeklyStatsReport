@@ -1,0 +1,606 @@
+---
+title: NRL State of Play
+execute:
+  echo: false
+format:
+  html:
+    grid:
+      margin-width: 200px
+      body-width: 1200px
+    page-layout: full
+    toc: true
+    smooth-scroll: true
+    theme: simplex
+    embed-resources: true
+jupyter: python3
+---
+
+```{python}
+#| scrolled: true
+import pandas as pd
+import numpy as np
+import matplotlib
+import requests
+from requests.auth import HTTPBasicAuth
+from bs4 import BeautifulSoup
+import lxml
+
+import itables
+import itables.options as opt
+# Set global options to hide search and info
+opt.searching = False  # Hides the search bar
+opt.info = False       # Hides "Showing X of Y entries" text
+opt.paging = False     # Optional: Removes pagination if you want to show all rows at once
+opt.columnDefs = [{"className": "dt-center", "targets": "_all"}]
+from itables import init_notebook_mode
+init_notebook_mode(all_interactive=True)
+
+import ipyaggrid
+
+from IPython.display import Markdown, HTML
+
+import warnings
+warnings.filterwarnings('ignore', category=FutureWarning)
+
+season = 2025
+comp = 111
+# read in team stats
+url = f'http://rugbyleague-api.stats.com/api/NRL/teamStatsV2/{comp}/{season}'
+response = requests.get(url, auth=HTTPBasicAuth('broncosuser','Bf4Xn&Tm'))
+soup_teamstats = BeautifulSoup(response.content,features='xml')
+
+# extract team stats by round
+team_round_data = []
+team_avg_data = []
+for t in soup_teamstats.find_all('team'):
+    team_avg_data.append(t.attrs|t.seasonAverageStats.attrs)
+    for r in t.find_all('round'):
+        team_round_data.append(t.attrs | r.attrs)
+team_avg_df = pd.DataFrame(team_avg_data)
+team_avg_df = team_avg_df.apply(pd.to_numeric, errors='ignore')
+team_round_df = pd.DataFrame(team_round_data)
+team_round_df = team_round_df.apply(pd.to_numeric, errors='ignore')
+
+# read in ladder positions
+url = f'http://rugbyleague-api.stats.com/api/NRL/competitions/ladder/{comp}/{season}'
+response = requests.get(url, auth=HTTPBasicAuth('broncosuser','Bf4Xn&Tm'))
+soup_ladder = BeautifulSoup(response.content,features='xml')
+
+#get current round
+current_round = int(soup_ladder.ladder.get('roundNumber'))
+
+#extract ladder data
+ladder_df = pd.DataFrame([i.attrs for i in soup_ladder.find_all('ladderposition')])
+
+#extract season form to individual columns
+ladder_df['seasonForm'] = ladder_df['seasonForm'].apply(lambda x: x[::-1])
+form_lists = ladder_df['seasonForm'].apply(list)
+rounds_df = pd.DataFrame(form_lists.tolist(),index=ladder_df.index)
+rounds_df.columns += 1
+ladder_df = pd.concat([ladder_df,rounds_df],axis=1)
+ladder_df = ladder_df.apply(pd.to_numeric, errors='ignore')
+```
+
+```{python}
+Markdown(f"# {season} End Round {current_round-1}")
+```
+
+## Ladder
+
+```{python}
+ladder_display_df = ladder_df.copy()
+ladder_display_map = {"position":"Pos",
+                      "teamNickName":"Team",
+                      "gamesPlayed":"Played",
+                      "competitionPoints":"Points",
+                      "pointsDifference":"Diff"
+                     }
+ladder_display_df = ladder_display_df[[col for col in ladder_display_df.columns if col in ladder_display_map.keys() or isinstance(col, int)]]
+ladder_display_df = ladder_display_df.rename(columns=ladder_display_map).set_index('Pos')
+# Add n blank columns with sequential names
+n = 27
+for i in range(current_round, n+1):
+    ladder_display_df[i] = ""
+
+# Color specific cells
+def colour_game_results(val):
+    if val == 'W':
+        return 'color: green'
+    elif val == 'L':
+        return 'color: red'
+    elif val == 'D':
+        return 'color: orange'
+    else:
+        return 'color: black'
+s = ladder_display_df.style.map(colour_game_results, subset=list(range(1,current_round)))
+
+itables.show(
+    s,
+    fixedColumns={"start": 5},
+    scrollX=True,
+)
+```
+
+## Attack Metrics
+
+```{python}
+# points for
+# ptbs inside 20m
+# completion percentage
+# run metres
+# metres/run
+# supports
+# tacklebreaks
+# offloads
+# errorsinown50
+# errorsinopp50
+
+attack_display_map = {'position':'Pos',
+                      'teamNickName':'Team',
+                      'points':'Points',
+                      'completionPercentage':'Comp %',
+                      'ptbOpp20m':'PTBin20m',
+                      'runs':'Runs',
+                      'runMetres':'Run Metres',
+                      'metresPerRun':'Metres/Run',
+                      'supports':'Supports',
+                      'linebreaks':'LB',
+                      'tackleBreaks':'TB',
+                      'errorsInOwn50':'Yd Err',
+                      'errorsInOpp50':'GB Err'}
+
+attack_df = pd.concat([ladder_df.set_index('teamId')[['position','teamNickName']],team_avg_df.copy().set_index('teamId')],axis=1)
+attack_df = attack_df[attack_display_map.keys()].reset_index(drop=True)
+
+attack_df = attack_df.rename(columns=attack_display_map)
+
+
+# Create a new empty dataframe for the final result
+columns = ['Pos', 'Team']
+stat_names = [col for col in attack_df.columns if col not in ['Pos', 'Team']]
+for stat in stat_names:
+    columns.extend([f"{stat}_Avg", f"{stat}_Rank"])
+
+final_df = pd.DataFrame(columns=columns)
+
+# Copy Pos and Team columns
+final_df['Pos'] = attack_df['Pos']
+final_df['Team'] = attack_df['Team']
+
+# Fill in the Avg and Rank columns
+for stat in stat_names:
+    # Add the original values
+    final_df[f"{stat}_Avg"] = attack_df[stat]
+    
+    # Calculate and add ranks
+    if stat in ['Yd Err', 'GB Err']:
+        # For errors, lower is better
+        final_df[f"{stat}_Rank"] = attack_df[stat].rank(method='min', ascending=True)
+    else:
+        # For most stats, higher is better
+        final_df[f"{stat}_Rank"] = attack_df[stat].rank(method='min',ascending=False)
+
+
+final_df = final_df.set_index(['Pos','Team'])
+# Create a nicer MultiIndex for the columns
+# Restructure the column names to a MultiIndex
+# column_tuples = [('', 'Pos'), ('', 'Team')]
+column_tuples = []
+for stat in stat_names:
+    column_tuples.extend([(stat, 'Avg'), (stat, 'Rank')])
+
+# Set the new MultiIndex
+final_df.columns = pd.MultiIndex.from_tuples(column_tuples)
+
+s = final_df.style
+s.background_gradient(axis=0, cmap="RdYlGn_r", subset = [(col,'Rank') for col in stat_names])
+s.format(precision=0, subset = [(col,'Rank') for col in stat_names])
+s.format(precision=1, subset = [(col,'Avg') for col in stat_names])
+s.set_sticky(axis="index")
+itables.show(
+    s,
+    fixedColumns={"start": 2},
+    scrollX=True,
+)
+```
+
+## Defence Metrics
+
+```{python}
+ladder_map = {'position':'Pos',
+              'teamNickName':'Team'
+             }
+
+def_opp_map = {'points':'Points Conc',
+                 'ptbOpp20m':'PTBin20m Conc',
+                 'runs':'Runs Conc',
+                 'runMetres':'Run Metres Conc',
+                 'metresPerRun':'Metres/Run Conc',
+                 'linebreaks':'LB Conc'
+                }
+def_team_map = {'tackles':'Made Tackles',
+                  'missedTackles':'Missed Tackles',
+                  'ineffectiveTackles':'Inef. Tackles',
+                  'effectiveTacklePercentage':'Eff. Tackle %',
+                  'penalties':'Pens',
+                  'ruckInfringements':'6 Again (Ruck)',
+                  'setRestartConceded10mOffside': '6 Again (Off)'
+                 }
+
+def_opp_df = team_round_df.groupby('oppositionId')[[k for k in def_opp_map.keys()]].mean()
+def_team_df = team_avg_df.set_index('teamId')[def_team_map.keys()].copy()
+
+defence_df = pd.concat([ladder_df.set_index('teamId')[['position','teamNickName']],def_opp_df,def_team_df],axis=1)
+defence_df = defence_df.rename(columns=ladder_map|def_opp_map|def_team_map)
+
+
+# Create a new empty dataframe for the final result
+columns = ['Pos', 'Team']
+stat_names = [col for col in defence_df.columns if col not in ['Pos', 'Team']]
+
+for stat in stat_names:
+    columns.extend([f"{stat}_Avg", f"{stat}_Rank"])
+
+final_df = pd.DataFrame(columns=columns)
+
+# Copy Pos and Team columns
+final_df['Pos'] = defence_df['Pos']
+final_df['Team'] = defence_df['Team']
+
+# Fill in the Avg and Rank columns
+for stat in stat_names:
+    # Add the original values
+    final_df[f"{stat}_Avg"] = defence_df[stat]
+    
+    # Calculate and add ranks
+    if stat in ['Eff. Tackle %']:
+        # For errors, lower is better
+        final_df[f"{stat}_Rank"] = defence_df[stat].rank(method='min', ascending=False)
+    else:
+        # For most stats, higher is better
+        final_df[f"{stat}_Rank"] = defence_df[stat].rank(method='min',ascending=True)
+
+
+final_df = final_df.set_index(['Pos','Team'])
+# Create a nicer MultiIndex for the columns
+# Restructure the column names to a MultiIndex
+# column_tuples = [('', 'Pos'), ('', 'Team')]
+column_tuples = []
+for stat in stat_names:
+    column_tuples.extend([(stat, 'Avg'), (stat, 'Rank')])
+
+# Set the new MultiIndex
+final_df.columns = pd.MultiIndex.from_tuples(column_tuples)
+
+s = final_df.style
+s.background_gradient(axis=0, cmap="RdYlGn_r", subset = [(col,'Rank') for col in stat_names])
+s.format(precision=0, subset = [(col,'Rank') for col in stat_names])
+s.format(precision=1, subset = [(col,'Avg') for col in stat_names])
+s.set_sticky(axis="index")
+itables.show(
+    s,
+    fixedColumns={"start": 2},
+    scrollX=True,
+)
+```
+
+## Broncos Game Metrics
+
+```{python}
+# points
+# completionpercentage
+# ptbopp20m
+# runs
+# runmetres
+# metresperrun
+# tackles
+broncos_id = 500011
+
+game_info = {'roundNumber':'Rd','oppositionId':'Opp',}
+
+game_map = {'points':'Points','completionPercentage':'Comp %','runs':'Runs','runMetres':'Run Metres','metresPerRun':'Metres/Run','supports':'Supports','linebreaks':'LB','errorsInOwn50':'Yd Err','tackles':'Made Tackles','effectiveTacklePercentage':'Eff. Tackle %','penalties':'Penalties'}
+
+
+for_df = team_round_df.query("teamId == @broncos_id").set_index(['roundNumber','oppositionId'])[game_map.keys()]
+for_df = for_df.rename_axis(index=['Rd','Opp']).rename(columns=game_map)
+against_df = team_round_df.query("oppositionId == @broncos_id").set_index(['roundNumber','teamId'])[game_map.keys()]
+against_df = against_df.rename_axis(index=['Rd','Opp']).rename(columns=game_map)
+diff_df = for_df - against_df
+
+
+final_df = pd.concat([for_df,against_df,diff_df],keys=['For','Ag','Diff'],axis=1).swaplevel(0, 1, axis=1).reindex(columns = [(col, i) for col in game_map.values() for i in ['For', 'Ag','Diff']])
+final_df = final_df.rename(index=ladder_df.set_index('teamId')['teamNickName'].to_dict(), level='Opp')
+
+results = final_df[('Points','Diff')].apply(
+    lambda x: 'W' if x > 0 else ('L' if x < 0 else 'D')
+)
+results.name = 'Res'
+final_df = final_df.set_index(results, append=True)
+
+s = final_df.style
+def colour_difference(val):
+    if val > 0:
+        return f'background-color: green; color: white'
+    elif val < 0:
+        return f'background-color: red; color: white'
+
+def colour_difference_reversed(val):
+    if val < 0:
+        return f'background-color: green; color: white'
+    elif val > 0:
+        return f'background-color: red; color: white'
+
+def colour_result(val):
+    print(type(val))
+    if val == 'W':
+        return 'color: green'
+    elif val == 'L':
+        return 'color: red'
+    else:
+        return ''
+
+lower_better_stats = ['Yd Err','Made Tackles','Penalties']
+
+s.applymap(colour_difference, subset = [(col,'Diff') for col in game_map.values() if col not in lower_better_stats])
+s.applymap(colour_difference_reversed, subset = [(col,'Diff') for col in lower_better_stats])
+s.map_index(lambda v: "color:green;font-weight:bold" if v=='W' else "color:red;font-weight:bold", axis=0,level=2)
+s.format(precision=1)
+s.set_sticky(axis="index")
+
+itables.show(
+    s,
+    fixedColumns={"start": 3},
+    scrollX=True,
+)
+```
+
+## Round Player Stats
+
+```{python}
+season = 2025
+comp = 111
+# read in team stats
+url = f'http://rugbyleague-api.stats.com/api/NRL/playerStatsV2/{comp}/{season}'
+response = requests.get(url, auth=HTTPBasicAuth('broncosuser','Bf4Xn&Tm'))
+soup_playerstats = BeautifulSoup(response.content,features='xml')
+
+# extract team stats by round
+player_round_data = []
+player_round_info = ['playerId','playerName']
+
+for p in soup_playerstats.find_all('player'):
+    info_dict = {i:p.get(i) for i in player_round_info}
+    for r in p.find_all('round'):
+        player_round_data.append(info_dict | r.attrs)
+player_round_df = pd.DataFrame(player_round_data)
+player_round_df = player_round_df.apply(pd.to_numeric, errors='ignore')
+player_round_df = player_round_df.query("mins > 0")
+player_round_df = player_round_df.sort_values(by=['roundNumber','gameID','teamId','positionId'])
+
+player_info_map = {'playerName':'Name','teamId':'Team','mins':'Min'}
+player_discipline_map = {'missedTackles':'MissTack',
+                         'effectiveTacklePercentage':'Eff.T%',
+                         'tryCause':'TryCause',
+                         'errors':'Err',
+                         'penalties':'Pen'}
+
+fullback_map = {'receipts':'Rec',
+                'allRuns':'Runs',
+                'allRunMetres':'Run Mets',
+                'tries':'T',
+                'tryAssists':'T Ass',
+                'linebreaks':'LB',
+                'linebreakAssists':'LB Ass',
+                'tackleBreaks':'TB',
+                'supports':'Supp',
+                'kicksDefused':'K Def',
+                'kicksNotDefused':'K Not Def'}
+
+winger_map = {'receipts':'Rec',
+                'allRuns':'Runs',
+                'allRunMetres':'Run Mets',
+                'tries':'T',
+                'linebreaks':'LB',
+                'tackleBreaks':'TB',
+                'supports':'Supp',
+                'kicksDefused':'K Def',
+                'kicksNotDefused':'K Not Def'}
+
+centre_map = {'receipts':'Rec',
+                'allRuns':'Runs',
+                'allRunMetres':'Run Mets',
+                'tries':'T',
+                'linebreaks':'LB',
+                'tackleBreaks':'TB',
+                'supports':'Supp',
+                'passes':'Pass'}
+
+halfback_map = {'receipts':'Rec',
+                'allRuns':'Runs',
+                'tries':'T',
+                'tryAssists':'T Ass',
+                'linebreaks':'LB',
+                'linebreakAssists':'LB Ass',
+                'supports':'Supp',
+                'kicks':'Kicks',
+                'kickMetres':'K Mets'}
+
+hooker_map = {'receipts':'Rec',
+                'allRuns':'Runs',
+                'tries':'T',
+                'tryAssists':'T Ass',
+                'linebreaks':'LB',
+                'linebreakAssists':'LB Ass',
+                'supports':'Supp',
+                'kicks':'Kicks',
+                'tackles':'Tackles'}
+
+backrow_map = {'receipts':'Rec',
+                'allRuns':'Runs',
+                'allRunMetres':'Run Mets',
+                'postContactMetres':'PC Mets',
+                'tries':'T',
+                'linebreaks':'LB',
+                'tackleBreaks':'TB',
+                'supports':'Supp',
+                'passes':'Pass',
+                'tackles':'Tackles'}
+
+prop_map = {'receipts':'Rec',
+                'allRuns':'Runs',
+                'allRunMetres':'Run Mets',
+                'postContactMetres':'PC Mets',
+                'tries':'T',
+                'linebreaks':'LB',
+                'tackleBreaks':'TB',
+                'supports':'Supp',
+                'passes':'Pass',
+                'tackles':'Tackles'}
+
+def player_current_round_table(round_df,current_round,position_name,position_map,info_map,discipline_map):
+    position_df = round_df.query('roundNumber == @current_round-1 and positionName == @position_name')[[k for k in (info_map|discipline_map|position_map).keys()]].copy()
+    position_df = position_df.rename(columns=info_map|discipline_map|position_map)
+    position_df = position_df.set_index([k for k in info_map.values()])
+    position_df = position_df.rename(index=ladder_df.set_index('teamId')['teamNickName'].to_dict(), level='Team')
+    s = position_df.style
+    s.format(precision=1)
+    # s.map_index(lambda v: "color:maroon;" if v=='Broncos' else "color:black;", axis=0,level=1)
+    broncos_indices = [idx for i, idx in enumerate(position_df.index) if idx[1] == 'Broncos']
+    s.apply(lambda x: ['background:yellow; color: maroon;font-weight: bold' if x.name in broncos_indices else '' for i in x], axis=1)
+    itables.show(
+    s,
+    fixedColumns={"start": 3},
+    scrollX=True,
+    )
+
+def player_season_average_table(round_df,position_name,position_map,info_map,discipline_map):
+    position_df = round_df.query('positionName == @position_name')[[k for k in (info_map|discipline_map|position_map).keys()]].copy()
+    position_df = position_df.rename(columns=info_map|discipline_map|position_map)
+    position_df = position_df.set_index([k for k in info_map.values()])
+    position_df = position_df.rename(index=ladder_df.set_index('teamId')['teamNickName'].to_dict(), level='Team')
+    s = position_df.style
+    s.format(precision=1)
+    # s.map_index(lambda v: "color:maroon;" if v=='Broncos' else "color:black;", axis=0,level=1)
+    broncos_indices = [idx for i, idx in enumerate(position_df.index) if idx[1] == 'Broncos']
+    s.apply(lambda x: ['background:yellow; color: maroon;font-weight: bold' if x.name in broncos_indices else '' for i in x], axis=1)
+    itables.show(
+    s,
+    fixedColumns={"start": 3},
+    scrollX=True,
+    )
+```
+
+### Fullbacks
+
+```{python}
+player_current_round_table(player_round_df,current_round,'Fullback',fullback_map,player_info_map,player_discipline_map)
+```
+
+### Wingers
+
+```{python}
+player_current_round_table(player_round_df,current_round,'Winger',winger_map,player_info_map,player_discipline_map)
+```
+
+### Centres
+
+```{python}
+player_current_round_table(player_round_df,current_round,'Centre',centre_map,player_info_map,player_discipline_map)
+```
+
+### 5/8ths
+
+```{python}
+player_current_round_table(player_round_df,current_round,'Five-Eighth',halfback_map,player_info_map,player_discipline_map)
+```
+
+### Halfbacks
+
+```{python}
+player_current_round_table(player_round_df,current_round,'Halfback',halfback_map,player_info_map,player_discipline_map)
+```
+
+### Hookers
+
+```{python}
+player_current_round_table(player_round_df,current_round,'Hooker',hooker_map,player_info_map,player_discipline_map)
+```
+
+### Backrows
+
+```{python}
+player_current_round_table(player_round_df,current_round,'2nd Row',backrow_map,player_info_map,player_discipline_map)
+```
+
+### Locks
+
+```{python}
+player_current_round_table(player_round_df,current_round,'Lock',prop_map,player_info_map,player_discipline_map)
+```
+
+### Props
+
+```{python}
+player_current_round_table(player_round_df,current_round,'Prop',prop_map,player_info_map,player_discipline_map)
+```
+
+### Interchange
+
+```{python}
+player_current_round_table(player_round_df,current_round,'Interchange',prop_map,player_info_map,player_discipline_map)
+```
+
+## Season Player Stats
+
+
+### Fullbacks
+
+
+### Wingers
+
+
+### Centres
+
+```{python}
+#centres
+```
+
+### 5/8ths
+
+```{python}
+#5/8ths
+```
+
+### Halfbacks
+
+```{python}
+#halves
+```
+
+### Hookers
+
+```{python}
+#hookers
+```
+
+### Backrows
+
+```{python}
+#back
+```
+
+### Locks
+
+```{python}
+#fullbacks
+```
+
+### Props
+
+```{python}
+###
+```
+
+### Interchange
+
+
